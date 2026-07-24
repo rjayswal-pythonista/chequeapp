@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { api, downloadBase64, openPdf } from '../api.js'
+import { api, downloadBase64, openPdf, apiDownloadFile } from '../api.js'
 
 function PrintModal({ cheque, onDone, onClose }) {
   const [note, setNote] = useState(null)
@@ -87,6 +87,7 @@ export default function Register() {
   const [status, setStatus] = useState('')
   const [printing, setPrinting] = useState(null)
   const [note, setNote] = useState(null)
+  const [exporting, setExporting] = useState(false)
 
   const load = () => api(`/cheques${status ? `?status=${status}` : ''}`).then(setRows).catch(e => setNote(e.message))
   useEffect(() => { load() }, [status])
@@ -97,16 +98,29 @@ export default function Register() {
     catch (e) { setNote(e.message) }
   }
 
+  async function exportRegister(format) {
+    setExporting(true); setNote(null)
+    try {
+      const qs = status ? `&status=${status}` : ''
+      await apiDownloadFile(`/cheques/export?format=${format}${qs}`)
+    } catch (e) { setNote(e.message) }
+    finally { setExporting(false) }
+  }
+
   return (
     <>
       <h1>Cheque register</h1>
       <div className="sub">Every cheque ever printed, searchable. Reprints never create duplicates.</div>
-      <div className="filters">
+      <div className="filters" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
         <select value={status} onChange={e => setStatus(e.target.value)} aria-label="Filter by status">
           <option value="">All statuses</option>
-          {['draft', 'pending_approval', 'approved', 'rejected', 'printed'].map(s =>
-            <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+          {['draft', 'pending_approval', 'pending_second_approval', 'approved', 'rejected', 'printed'].map(s =>
+            <option key={s} value={s}>{s.replace(/_/g, ' ')}</option>)}
         </select>
+        <div style={{ marginLeft: 'auto' }}>
+          <button className="quiet" disabled={exporting} onClick={() => exportRegister('csv')}>Export CSV</button>{' '}
+          <button className="quiet" disabled={exporting} onClick={() => exportRegister('pdf')}>Export PDF</button>
+        </div>
       </div>
       {note && <div className="error-note" style={{ marginBottom: 14 }}>{note}</div>}
       {rows && rows.length === 0 && <div className="empty">No cheques yet. Create your first one from “New cheque”.</div>}

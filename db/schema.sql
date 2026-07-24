@@ -9,6 +9,7 @@ CREATE TABLE organizations (
   name TEXT NOT NULL,
   plan_tier TEXT NOT NULL DEFAULT 'starter',            -- 'starter' | 'growth' | 'business'
   maker_checker_enabled BOOLEAN NOT NULL DEFAULT false,
+  dual_approval_threshold_paise BIGINT,                 -- NULL = disabled; cheques >= this need 2 checkers
   subscription_status TEXT NOT NULL DEFAULT 'active'
     CHECK (subscription_status IN ('active','grace','lapsed')),
   grace_until TIMESTAMPTZ,
@@ -62,8 +63,9 @@ CREATE TABLE cheques (
   cheque_date DATE NOT NULL,
   memo TEXT,
   status TEXT NOT NULL DEFAULT 'draft'
-    CHECK (status IN ('draft','pending_approval','approved','rejected','printed')),
+    CHECK (status IN ('draft','pending_approval','pending_second_approval','approved','rejected','printed')),
   created_by UUID NOT NULL REFERENCES users(id),
+  first_approved_by UUID REFERENCES users(id),  -- set when dual approval's first checker signs off
   approved_by UUID REFERENCES users(id),
   rejected_reason TEXT,
   printed_at TIMESTAMPTZ,
@@ -75,7 +77,7 @@ CREATE TABLE audit_log (
   org_id UUID NOT NULL REFERENCES organizations(id),
   cheque_id UUID REFERENCES cheques(id),
   actor_user_id UUID NOT NULL REFERENCES users(id),
-  action TEXT NOT NULL CHECK (action IN ('created','submitted','approved','rejected','printed','reprinted')),
+  action TEXT NOT NULL CHECK (action IN ('created','submitted','first_approved','approved','rejected','printed','reprinted')),
   detail JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

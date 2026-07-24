@@ -12,7 +12,7 @@ import os
 
 from fastapi import Depends, FastAPI, File, Form, Header, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from app import billing, core
@@ -125,6 +125,13 @@ class UserIn(BaseModel):
     role: str  # 'maker' | 'checker' | 'admin'
 
 
+class OrgSettingsIn(BaseModel):
+    maker_checker_enabled: bool | None = None
+    dual_approval_threshold_paise: int | None = None
+    clear_dual_approval_threshold: bool = False  # explicit flag to null it out again
+
+
+
 # ---------- audit helper ----------
 
 def audit(conn, org_id, cheque_id, actor, action, detail=None):
@@ -189,6 +196,46 @@ def add_user(body: UserIn, dep=Depends(org_conn)):
     return {**user, "id": str(user["id"])}
 
 
+# ---------- org settings ----------
+
+@app.get("/org/settings")
+def get_org_settings(dep=Depends(org_conn)):
+    conn, claims = dep
+    row = conn.execute(
+        "SELECT maker_checker_enabled, dual_approval_threshold_paise FROM organizations WHERE id = %s",
+        (claims["org_id"],),
+    ).fetchone()
+    return {"maker_checker_enabled": row["maker_checker_enabled"],
+            "dual_approval_threshold_paise": row["dual_approval_threshold_paise"]}
+
+
+@app.patch("/org/settings")
+def update_org_settings(body: OrgSettingsIn, dep=Depends(org_conn_writable)):
+    conn, claims = dep
+    if claims["role"] != "admin":
+        raise ApiError(403, "FORBIDDEN", "Only admins can change organization settings.")
+    if body.dual_approval_threshold_paise is not None and body.dual_approval_threshold_paise <= 0:
+        raise ApiError(400, "VALIDATION_ERROR", "Threshold must be greater than zero.",
+                       "dual_approval_threshold_paise")
+    fields, params = [], []
+    if body.maker_checker_enabled is not None:
+        fields.append("maker_checker_enabled = %s"); params.append(body.maker_checker_enabled)
+    if body.clear_dual_approval_threshold:
+        fields.append("dual_approval_threshold_paise = NULL")
+    elif body.dual_approval_threshold_paise is not None:
+        fields.append("dual_approval_threshold_paise = %s"); params.append(body.dual_approval_threshold_paise)
+    if not fields:
+        raise ApiError(400, "VALIDATION_ERROR", "No settings provided to update.")
+    params.append(claims["org_id"])
+    row = conn.execute(
+        f"UPDATE organizations SET {', '.join(fields)} WHERE id = %s "
+        "RETURNING maker_checker_enabled, dual_approval_threshold_paise",
+        params,
+    ).fetchone()
+    return {"maker_checker_enabled": row["maker_checker_enabled"],
+            "dual_approval_threshold_paise": row["dual_approval_threshold_paise"]}
+
+
 # ---------- payees ----------
 
 @app.get("/payees")
@@ -216,12 +263,47 @@ def create_payee(body: PayeeIn, dep=Depends(org_conn_writable)):
 def create_template(body: TemplateIn, dep=Depends(org_conn_writable)):
     import json
     conn, claims = dep
+    if claims["role"] != "admin":
+        raise ApiError(403, "FORBIDDEN", "Only admins can create bank templates.")
     row = conn.execute(
         "INSERT INTO bank_templates (org_id, bank_name, page_width_mm, page_height_mm, fields) "
         "VALUES (%s, %s, %s, %s, %s) RETURNING id, bank_name",
         (claims["org_id"], body.bank_name, body.page_width_mm, body.page_height_mm, json.dumps(body.fields)),
     ).fetchone()
     return {**row, "id": str(row["id"])}
+
+
+def _serialize_template(row):
+    return {**row, "id": str(row["id"]),
+            "page_width_mm": float(row["page_width_mm"]),
+            "page_height_mm": float(row["page_height_mm"]),
+            "printer_offset_x_mm": float(row["printer_offset_x_mm"]),
+            "printer_offset_y_mm": float(row["printer_offset_y_mm"])}
+
+
+@app.get("/bank-templates/{template_id}")
+def get_template(template_id: str, dep=Depends(org_conn)):
+    conn, _ = dep
+    row = conn.execute("SELECT * FROM bank_templates WHERE id = %s", (template_id,)).fetchone()
+    if not row:
+        raise ApiError(404, "NOT_FOUND", "Bank template not found.")
+    return _serialize_template(row)
+
+
+@app.patch("/bank-templates/{template_id}", status_code=200)
+def update_template(template_id: str, body: TemplateIn, dep=Depends(org_conn_writable)):
+    import json
+    conn, claims = dep
+    if claims["role"] != "admin":
+        raise ApiError(403, "FORBIDDEN", "Only admins can edit bank templates.")
+    row = conn.execute(
+        "UPDATE bank_templates SET bank_name = %s, page_width_mm = %s, page_height_mm = %s, fields = %s "
+        "WHERE id = %s RETURNING *",
+        (body.bank_name, body.page_width_mm, body.page_height_mm, json.dumps(body.fields), template_id),
+    ).fetchone()
+    if not row:
+        raise ApiError(404, "NOT_FOUND", "Bank template not found.")
+    return _serialize_template(row)
 
 
 # ---------- cheques (Tasks 5.3, 5.4, 5.6) ----------
@@ -236,7 +318,7 @@ def _get_cheque(conn, cheque_id):
 
 def _serialize(row):
     out = {k: v for k, v in row.items()}
-    for k in ("id", "org_id", "bank_template_id", "payee_id", "created_by", "approved_by"):
+    for k in ("id", "org_id", "bank_template_id", "payee_id", "created_by", "first_approved_by", "approved_by"):
         if out.get(k) is not None:
             out[k] = str(out[k])
     out["cheque_date"] = str(out["cheque_date"])
@@ -292,11 +374,36 @@ def approve_cheque(cheque_id: str, dep=Depends(org_conn_writable)):
     if claims["role"] not in ("checker", "admin"):
         raise ApiError(403, "FORBIDDEN", "Only a checker or admin can approve cheques.")
     row = _get_cheque(conn, cheque_id)
-    if row["status"] != "pending_approval":
+    if row["status"] not in ("pending_approval", "pending_second_approval"):
         raise ApiError(409, "CONFLICT", f"Cannot approve a cheque in status '{row['status']}'.")
     # Maker-checker separation: the creator can never approve their own cheque
     if str(row["created_by"]) == claims["sub"]:
         raise ApiError(403, "FORBIDDEN", "The creator of a cheque cannot approve it.")
+
+    if row["status"] == "pending_approval":
+        org = conn.execute(
+            "SELECT dual_approval_threshold_paise FROM organizations WHERE id = %s", (claims["org_id"],)
+        ).fetchone()
+        threshold = org["dual_approval_threshold_paise"]
+        needs_second = threshold is not None and row["amount_paise"] >= threshold
+        if needs_second:
+            row = conn.execute(
+                "UPDATE cheques SET status = 'pending_second_approval', first_approved_by = %s "
+                "WHERE id = %s RETURNING *",
+                (claims["sub"], cheque_id),
+            ).fetchone()
+            audit(conn, claims["org_id"], cheque_id, claims["sub"], "first_approved")
+            return _serialize(row)
+        row = conn.execute(
+            "UPDATE cheques SET status = 'approved', approved_by = %s WHERE id = %s RETURNING *",
+            (claims["sub"], cheque_id),
+        ).fetchone()
+        audit(conn, claims["org_id"], cheque_id, claims["sub"], "approved")
+        return _serialize(row)
+
+    # pending_second_approval: a different checker/admin must give the final sign-off
+    if row["first_approved_by"] is not None and str(row["first_approved_by"]) == claims["sub"]:
+        raise ApiError(403, "FORBIDDEN", "The same checker cannot give both approvals on a cheque.")
     row = conn.execute(
         "UPDATE cheques SET status = 'approved', approved_by = %s WHERE id = %s RETURNING *",
         (claims["sub"], cheque_id),
@@ -311,7 +418,7 @@ def reject_cheque(cheque_id: str, body: RejectIn, dep=Depends(org_conn_writable)
     if claims["role"] not in ("checker", "admin"):
         raise ApiError(403, "FORBIDDEN", "Only a checker or admin can reject cheques.")
     row = _get_cheque(conn, cheque_id)
-    if row["status"] != "pending_approval":
+    if row["status"] not in ("pending_approval", "pending_second_approval"):
         raise ApiError(409, "CONFLICT", f"Cannot reject a cheque in status '{row['status']}'.")
     row = conn.execute(
         "UPDATE cheques SET status = 'rejected', rejected_reason = %s WHERE id = %s RETURNING *",
@@ -465,23 +572,111 @@ def bulk_create_cheques(bank_template_id: str = Form(...), file: UploadFile = Fi
     return {"created": created, "failed": len(results) - created, "rows": results}
 
 
-@app.get("/cheques")
-def search_cheques(payee_id: str | None = None, status: str | None = None,
-                   date_from: dt.date | None = None, date_to: dt.date | None = None,
-                   dep=Depends(org_conn)):
-    conn, _ = dep
+def _build_cheque_query(payee_id, status, date_from, date_to):
     q = "SELECT * FROM cheques WHERE true"
     params: list = []
     if payee_id:
         q += " AND payee_id = %s"; params.append(payee_id)
     if status:
-        q += " AND status = %s"; params.append(status)
+        statuses = [s.strip() for s in status.split(",") if s.strip()]
+        if len(statuses) == 1:
+            q += " AND status = %s"; params.append(statuses[0])
+        elif statuses:
+            q += f" AND status IN ({','.join(['%s'] * len(statuses))})"; params.extend(statuses)
     if date_from:
         q += " AND cheque_date >= %s"; params.append(date_from)
     if date_to:
         q += " AND cheque_date <= %s"; params.append(date_to)
     q += " ORDER BY created_at DESC"
+    return q, params
+
+
+@app.get("/cheques")
+def search_cheques(payee_id: str | None = None, status: str | None = None,
+                   date_from: dt.date | None = None, date_to: dt.date | None = None,
+                   dep=Depends(org_conn)):
+    conn, _ = dep
+    q, params = _build_cheque_query(payee_id, status, date_from, date_to)
     return [_serialize(r) for r in conn.execute(q, params).fetchall()]
+
+
+@app.get("/cheques/export")
+def export_cheques(format: str = "csv", payee_id: str | None = None, status: str | None = None,
+                    date_from: dt.date | None = None, date_to: dt.date | None = None,
+                    dep=Depends(org_conn)):
+    conn, _ = dep
+    if format not in ("csv", "pdf"):
+        raise ApiError(400, "VALIDATION_ERROR", "format must be 'csv' or 'pdf'.", "format")
+    q, params = _build_cheque_query(payee_id, status, date_from, date_to)
+    q = q.replace("SELECT * FROM cheques",
+                  "SELECT cheques.*, payees.name AS payee_name FROM cheques "
+                  "JOIN payees ON payees.id = cheques.payee_id")
+    rows = conn.execute(q, params).fetchall()
+
+    if format == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["Date", "Payee", "Amount (INR)", "Status", "Memo"])
+        for r in rows:
+            writer.writerow([str(r["cheque_date"]), r["payee_name"],
+                              f"{r['amount_paise'] / 100:.2f}", r["status"], r["memo"] or ""])
+        return Response(content=buf.getvalue(), media_type="text/csv",
+                         headers={"Content-Disposition": "attachment; filename=cheque_register.csv"})
+
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4))
+    data = [["Date", "Payee", "Amount (INR)", "Status", "Memo"]]
+    for r in rows:
+        data.append([str(r["cheque_date"]), r["payee_name"],
+                     f"{r['amount_paise'] / 100:,.2f}", r["status"], r["memo"] or ""])
+    table = Table(data, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+    ]))
+    doc.build([table])
+    return Response(content=buf.getvalue(), media_type="application/pdf",
+                     headers={"Content-Disposition": "attachment; filename=cheque_register.pdf"})
+
+
+# ---------- analytics dashboard ----------
+
+@app.get("/analytics/summary")
+def analytics_summary(dep=Depends(org_conn)):
+    conn, _ = dep
+    by_status = conn.execute("SELECT status, count(*) AS cnt FROM cheques GROUP BY status").fetchall()
+    spend_by_month = conn.execute(
+        "SELECT to_char(date_trunc('month', cheque_date), 'YYYY-MM') AS month, "
+        "sum(amount_paise) AS total_paise, count(*) AS cnt "
+        "FROM cheques WHERE status != 'rejected' GROUP BY 1 ORDER BY 1"
+    ).fetchall()
+    spend_by_payee = conn.execute(
+        "SELECT p.name AS payee_name, sum(c.amount_paise) AS total_paise, count(*) AS cnt "
+        "FROM cheques c JOIN payees p ON p.id = c.payee_id "
+        "WHERE c.status != 'rejected' GROUP BY p.name ORDER BY total_paise DESC LIMIT 20"
+    ).fetchall()
+    avg_row = conn.execute(
+        "SELECT AVG(EXTRACT(EPOCH FROM (appr.created_at - sub.created_at)) / 3600.0) AS avg_hours "
+        "FROM (SELECT cheque_id, created_at FROM audit_log WHERE action = 'submitted') sub "
+        "JOIN (SELECT cheque_id, MAX(created_at) AS created_at FROM audit_log "
+        "      WHERE action = 'approved' GROUP BY cheque_id) appr USING (cheque_id)"
+    ).fetchone()
+    by_status_map = {r["status"]: r["cnt"] for r in by_status}
+    return {
+        "by_status": by_status_map,
+        "spend_by_month": [{"month": r["month"], "total_paise": r["total_paise"], "count": r["cnt"]}
+                           for r in spend_by_month],
+        "spend_by_payee": [{"payee_name": r["payee_name"], "total_paise": r["total_paise"], "count": r["cnt"]}
+                           for r in spend_by_payee],
+        "avg_approval_hours": float(avg_row["avg_hours"]) if avg_row["avg_hours"] is not None else None,
+        "pending_approval_count": by_status_map.get("pending_approval", 0)
+                                   + by_status_map.get("pending_second_approval", 0),
+    }
 
 
 # ---------- calibration (main spec 3.4: per-printer offsets) ----------

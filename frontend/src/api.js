@@ -13,6 +13,19 @@ export function setToken(t) {
 
 export function hasToken() { return !!token }
 
+// Client-side-only convenience for showing/hiding nav items. The backend
+// independently enforces every role check regardless of what the UI shows.
+export function currentClaims() {
+  if (!token) return null
+  try {
+    const payload = token.split('.')[1]
+    const json = atob(payload.replace(/-/g, '+').replace(/_/g, '/'))
+    return JSON.parse(decodeURIComponent(escape(json)))
+  } catch {
+    return null
+  }
+}
+
 export async function api(path, { method = 'GET', body } = {}) {
   const res = await fetch(BASE + path, {
     method,
@@ -46,6 +59,28 @@ export async function apiUpload(path, formData) {
     throw err
   }
   return data
+}
+
+// For file downloads (e.g. register export) — the response body isn't JSON,
+// so this streams it straight to a browser download instead of parsing it.
+export async function apiDownloadFile(path) {
+  const res = await fetch(BASE + path, {
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    const err = data?.error || { code: 'UNKNOWN', message: 'Something went wrong.' }
+    err.status = res.status
+    throw err
+  }
+  const blob = await res.blob()
+  const disposition = res.headers.get('Content-Disposition') || ''
+  const match = /filename="?([^"]+)"?/.exec(disposition)
+  const filename = match ? match[1] : 'download'
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url; a.download = filename; a.click()
+  URL.revokeObjectURL(url)
 }
 
 export function downloadBase64(b64, filename, mime) {

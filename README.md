@@ -67,6 +67,34 @@ are read-only: register/search keep working, create/print return 402
 SUBSCRIPTION_LAPSED. Razorpay HMAC signature verification is stubbed
 (no live credentials in this scaffold) — see app/billing.py.
 
+## Amount-tiered dual approval (Gap Analysis — Medium priority)
+Admin-configurable `dual_approval_threshold_paise` (Settings page /
+`PATCH /org/settings`, admin-only). Cheques at or above the threshold move
+`pending_approval` -> `pending_second_approval` -> `approved`, requiring two
+distinct checkers (the same checker can't give both approvals; the creator
+can never approve at either stage). Below the threshold, a single approval
+is final, same as before.
+
+## Self-serve bank template admin UI (Gap Analysis)
+`GET/PATCH /bank-templates/{id}` (admin-only for create/edit) plus a
+frontend Bank templates page — build/edit templates (dimensions, per-field
+x/y/font/bold/underline) without hand-writing JSON via the API.
+
+## Exportable register (Gap Analysis — Medium priority)
+`GET /cheques/export?format=csv|pdf` (same filters as `/cheques`). Register
+page has Export CSV / Export PDF buttons.
+
+## Cheque analytics dashboard (Gap Analysis — Medium priority)
+`GET /analytics/summary`: counts by status, spend by month, top payees by
+spend, average approval turnaround time. Frontend Analytics page.
+
+## CI
+`.github/workflows/ci.yml` runs the full pytest suite against a Postgres
+service container, plus a frontend production build, on every push/PR to
+`main`.
+
 ## Not yet built
 Object storage for PDFs (currently base64 in responses), live Razorpay
-credentials + signature verification, deployment/CI, admin panel.
+credentials + signature verification, email/SMS/WhatsApp notifications,
+stop-payment register, accounting-software export, multi-branch/account
+management, white-label branding.

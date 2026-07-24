@@ -118,6 +118,7 @@ td.num { font-family: var(--font-mono); }
 .badge { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 12px; font-weight: 600; }
 .badge.draft { background: #efede5; color: var(--ink-soft); }
 .badge.pending_approval { background: #fdf3e0; color: #9a6c14; }
+.badge.pending_second_approval { background: #fdf3e0; color: #9a6c14; }
 .badge.approved { background: var(--ok-tint); color: var(--ok); }
 .badge.rejected { background: var(--stamp-tint); color: var(--stamp); }
 .badge.printed { background: var(--guilloche-tint); color: var(--guilloche); }
