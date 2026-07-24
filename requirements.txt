@@ -4,3 +4,4 @@ psycopg[binary]
 pyjwt
 bcrypt
 reportlab
+python-multipart

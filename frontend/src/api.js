@@ -31,6 +31,23 @@ export async function api(path, { method = 'GET', body } = {}) {
   return data
 }
 
+// For multipart uploads (e.g. bulk CSV) — no Content-Type header so the
+// browser sets the multipart boundary itself.
+export async function apiUpload(path, formData) {
+  const res = await fetch(BASE + path, {
+    method: 'POST',
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: formData,
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    const err = data?.error || { code: 'UNKNOWN', message: 'Something went wrong.' }
+    err.status = res.status
+    throw err
+  }
+  return data
+}
+
 export function downloadBase64(b64, filename, mime) {
   const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0))
   const url = URL.createObjectURL(new Blob([bytes], { type: mime }))

@@ -31,9 +31,10 @@ PyJWT + bcrypt, ReportLab.
 
 ## Frontend (frontend/)
 Vite + React app: login/signup, cheque entry with live cheque-leaf preview
-(live amount-to-words), checker approvals queue, register with per-printer-type
-print modal (inkjet/laser PDF, dot matrix ESC/P .prn, digital PDF), print
-calibration (per-template mm offsets), billing status page.
+(live amount-to-words), bulk CSV upload, checker approvals queue, register with
+per-printer-type print modal (inkjet/laser PDF, dot matrix ESC/P .prn, digital
+PDF, optional crossing stamp + cancelled watermark), print calibration
+(per-template mm offsets), billing status page.
 
     cd frontend && npm install && npm run dev   # proxies /api -> localhost:8000
 
@@ -43,6 +44,21 @@ calibration (per-template mm offsets), billing status page.
   `lp -o raw file.prn` or `copy /b file.prn LPT1`); physical calibration
   against the client's printer model still required
 - Digital: same PDF, downloaded for records/email
+
+## Print styling & crossing (Gap Analysis — High priority)
+- Per-field font family (Helvetica/Times-Roman/Courier), bold, underline via
+  optional keys on each bank_templates.fields entry
+- Crossing stamps (A/C Payee Only, Not Negotiable, custom text) and a
+  Cancelled watermark, selectable per print/reprint via query params
+  (`crossing`, `crossing_text`, `watermark_cancelled`); rendered as diagonal
+  lines/rotated text in the PDF path and a plain banner line in the ESC/P path
+
+## Bulk cheque entry (Gap Analysis — High priority)
+`POST /cheques/bulk` (multipart form: `bank_template_id` + CSV `file`).
+Columns: `payee_name`, `amount` (rupees), `cheque_date` (YYYY-MM-DD), optional
+`memo`. Each row is validated and inserted independently (per-row DB savepoint)
+— one bad row never blocks the rest of the batch. Missing payees are created
+automatically. Frontend page: Bulk upload.
 
 ## Billing (Task 5.8)
 Webhook-driven subscription state machine (active -> grace -> lapsed ->

@@ -4,6 +4,7 @@ import { BrowserRouter, Routes, Route, NavLink, Navigate, useNavigate } from 're
 import { hasToken, setToken } from './api.js'
 import Login from './pages/Login.jsx'
 import NewCheque from './pages/NewCheque.jsx'
+import BulkUpload from './pages/BulkUpload.jsx'
 import Approvals from './pages/Approvals.jsx'
 import Register from './pages/Register.jsx'
 import Calibration from './pages/Calibration.jsx'
@@ -18,6 +19,7 @@ function Shell({ children }) {
       <nav className="rail">
         <div className="brand">ChequeDesk<small>error-proof cheque printing</small></div>
         <NavLink to="/new">New cheque</NavLink>
+        <NavLink to="/bulk-upload">Bulk upload</NavLink>
         <NavLink to="/approvals">Approvals</NavLink>
         <NavLink to="/register">Register</NavLink>
         <NavLink to="/calibration">Calibration</NavLink>
@@ -36,6 +38,7 @@ function App() {
       <Routes>
         <Route path="/login" element={<Login />} />
         <Route path="/new" element={<Shell><NewCheque /></Shell>} />
+        <Route path="/bulk-upload" element={<Shell><BulkUpload /></Shell>} />
         <Route path="/approvals" element={<Shell><Approvals /></Shell>} />
         <Route path="/register" element={<Shell><Register /></Shell>} />
         <Route path="/calibration" element={<Shell><Calibration /></Shell>} />

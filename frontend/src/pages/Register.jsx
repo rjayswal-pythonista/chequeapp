@@ -3,13 +3,26 @@ import { api, downloadBase64, openPdf } from '../api.js'
 
 function PrintModal({ cheque, onDone, onClose }) {
   const [note, setNote] = useState(null)
+  const [crossing, setCrossing] = useState('none')
+  const [crossingText, setCrossingText] = useState('')
+  const [cancelled, setCancelled] = useState(false)
   const isReprint = cheque.status === 'printed'
   const verb = isReprint ? 'reprint' : 'print'
+
+  function stampParams() {
+    const p = new URLSearchParams()
+    if (crossing !== 'none') p.set('crossing', crossing)
+    if (crossing === 'custom' && crossingText.trim()) p.set('crossing_text', crossingText.trim())
+    if (cancelled) p.set('watermark_cancelled', 'true')
+    return p.toString()
+  }
 
   async function run(format, deliver) {
     setNote(null)
     try {
-      const r = await api(`/cheques/${cheque.id}/${verb}?format=${format}`, { method: 'POST' })
+      const extra = stampParams()
+      const qs = `format=${format}${extra ? `&${extra}` : ''}`
+      const r = await api(`/cheques/${cheque.id}/${verb}?${qs}`, { method: 'POST' })
       if (format === 'pdf') {
         if (deliver === 'open') openPdf(r.pdf_base64)
         else downloadBase64(r.pdf_base64, `cheque-${cheque.id.slice(0, 8)}.pdf`, 'application/pdf')
@@ -28,18 +41,38 @@ function PrintModal({ cheque, onDone, onClose }) {
           Choose the printer this cheque leaf is loaded in.
           {isReprint && ' Reprinting regenerates the output without creating a duplicate register entry.'}
         </p>
-        <button className="printer-opt" onClick={() => run('pdf', 'open')}>
-          <strong>Inkjet or laser</strong>
-          <span>Opens the positioned PDF — print it from the dialog onto the loaded cheque leaf.</span>
-        </button>
-        <button className="printer-opt" onClick={() => run('escp', 'download')}>
-          <strong>Dot matrix (continuous booklet)</strong>
-          <span>Downloads a raw ESC/P file (.prn). Send it straight to the printer, e.g. <code>copy /b file.prn LPT1</code> or <code>lp -o raw</code>.</span>
-        </button>
-        <button className="printer-opt" onClick={() => run('pdf', 'download')}>
-          <strong>Digital PDF only</strong>
-          <span>Downloads the PDF for records or email — nothing goes to a printer.</span>
-        </button>
+
+        <label htmlFor="crossing">Crossing stamp (optional)</label>
+        <select id="crossing" value={crossing} onChange={e => setCrossing(e.target.value)}>
+          <option value="none">None</option>
+          <option value="ac_payee">A/C Payee Only</option>
+          <option value="not_negotiable">Not Negotiable</option>
+          <option value="custom">Custom text</option>
+        </select>
+        {crossing === 'custom' && (
+          <input value={crossingText} onChange={e => setCrossingText(e.target.value)}
+                 placeholder="e.g. Pay self only" style={{ marginTop: 8 }} />
+        )}
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }}>
+          <input type="checkbox" checked={cancelled} onChange={e => setCancelled(e.target.checked)}
+                 style={{ width: 'auto' }} />
+          <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>Cancelled watermark</span>
+        </label>
+
+        <div style={{ marginTop: 16 }}>
+          <button className="printer-opt" onClick={() => run('pdf', 'open')}>
+            <strong>Inkjet or laser</strong>
+            <span>Opens the positioned PDF — print it from the dialog onto the loaded cheque leaf.</span>
+          </button>
+          <button className="printer-opt" onClick={() => run('escp', 'download')}>
+            <strong>Dot matrix (continuous booklet)</strong>
+            <span>Downloads a raw ESC/P file (.prn). Send it straight to the printer, e.g. <code>copy /b file.prn LPT1</code> or <code>lp -o raw</code>.</span>
+          </button>
+          <button className="printer-opt" onClick={() => run('pdf', 'download')}>
+            <strong>Digital PDF only</strong>
+            <span>Downloads the PDF for records or email — nothing goes to a printer.</span>
+          </button>
+        </div>
         {note && <div className="error-note">{note}</div>}
         <div style={{ textAlign: 'right', marginTop: 16 }}>
           <button className="quiet" onClick={onClose}>Cancel</button>

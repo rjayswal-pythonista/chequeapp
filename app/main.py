@@ -5,10 +5,12 @@ request body) and binds it to the DB connection's RLS context, so a
 query physically cannot see another tenant's rows.
 """
 import base64
+import csv
 import datetime as dt
+import io
 import os
 
-from fastapi import Depends, FastAPI, Header, Request
+from fastapi import Depends, FastAPI, File, Form, Header, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -319,7 +321,11 @@ def reject_cheque(cheque_id: str, body: RejectIn, dep=Depends(org_conn_writable)
     return _serialize(row)
 
 
-def _render_output(conn, row, fmt: str = "pdf") -> str:
+CROSSING_VALUES = (None, "none", "ac_payee", "not_negotiable", "custom")
+
+
+def _render_output(conn, row, fmt: str = "pdf", *, crossing: str | None = None,
+                    crossing_text: str | None = None, watermark_cancelled: bool = False) -> str:
     tpl = conn.execute("SELECT * FROM bank_templates WHERE id = %s", (row["bank_template_id"],)).fetchone()
     payee = conn.execute("SELECT name FROM payees WHERE id = %s", (row["payee_id"],)).fetchone()
     d = row["cheque_date"]
@@ -331,15 +337,25 @@ def _render_output(conn, row, fmt: str = "pdf") -> str:
         "amount_figures": figures,
         "date_day": f"{d.day:02d}", "date_month": f"{d.month:02d}", "date_year": str(d.year),
     }
-    raw = generate_cheque_escp(tpl, data) if fmt == "escp" else generate_cheque_pdf(tpl, data)
+    if fmt == "escp":
+        raw = generate_cheque_escp(tpl, data, crossing=crossing, crossing_text=crossing_text,
+                                    watermark_cancelled=watermark_cancelled)
+    else:
+        raw = generate_cheque_pdf(tpl, data, crossing=crossing, crossing_text=crossing_text,
+                                   watermark_cancelled=watermark_cancelled)
     return base64.b64encode(raw).decode()
 
 
 @app.post("/cheques/{cheque_id}/print")
-def print_cheque(cheque_id: str, format: str = "pdf", dep=Depends(org_conn_writable)):
+def print_cheque(cheque_id: str, format: str = "pdf", crossing: str | None = None,
+                  crossing_text: str | None = None, watermark_cancelled: bool = False,
+                  dep=Depends(org_conn_writable)):
     conn, claims = dep
     if format not in ("pdf", "escp"):
         raise ApiError(400, "VALIDATION_ERROR", "format must be 'pdf' or 'escp'.", "format")
+    if crossing not in CROSSING_VALUES:
+        raise ApiError(400, "VALIDATION_ERROR",
+                       "crossing must be one of: none, ac_payee, not_negotiable, custom.", "crossing")
     row = _get_cheque(conn, cheque_id)
     mc = conn.execute(
         "SELECT maker_checker_enabled FROM organizations WHERE id = %s", (claims["org_id"],)
@@ -349,7 +365,8 @@ def print_cheque(cheque_id: str, format: str = "pdf", dep=Depends(org_conn_writa
         raise ApiError(409, "CONFLICT",
                        "Cheque must be approved before printing." if mc
                        else f"Cannot print a cheque in status '{row['status']}'.")
-    out_b64 = _render_output(conn, row, format)
+    out_b64 = _render_output(conn, row, format, crossing=crossing, crossing_text=crossing_text,
+                              watermark_cancelled=watermark_cancelled)
     row = conn.execute(
         "UPDATE cheques SET status = 'printed', printed_at = now() WHERE id = %s RETURNING *",
         (cheque_id,),
@@ -360,17 +377,92 @@ def print_cheque(cheque_id: str, format: str = "pdf", dep=Depends(org_conn_writa
 
 
 @app.post("/cheques/{cheque_id}/reprint")
-def reprint_cheque(cheque_id: str, format: str = "pdf", dep=Depends(org_conn_writable)):
+def reprint_cheque(cheque_id: str, format: str = "pdf", crossing: str | None = None,
+                    crossing_text: str | None = None, watermark_cancelled: bool = False,
+                    dep=Depends(org_conn_writable)):
     conn, claims = dep
     if format not in ("pdf", "escp"):
         raise ApiError(400, "VALIDATION_ERROR", "format must be 'pdf' or 'escp'.", "format")
+    if crossing not in CROSSING_VALUES:
+        raise ApiError(400, "VALIDATION_ERROR",
+                       "crossing must be one of: none, ac_payee, not_negotiable, custom.", "crossing")
     row = _get_cheque(conn, cheque_id)
     if row["status"] != "printed":
         raise ApiError(409, "CONFLICT", "Only a printed cheque can be reprinted.")
-    out_b64 = _render_output(conn, row, format)  # regenerate — no new row, no status change
+    out_b64 = _render_output(conn, row, format, crossing=crossing, crossing_text=crossing_text,
+                              watermark_cancelled=watermark_cancelled)  # regenerate — no new row, no status change
     audit(conn, claims["org_id"], cheque_id, claims["sub"], "reprinted", {"format": format})
     key = "pdf_base64" if format == "pdf" else "escp_base64"
     return {"cheque": _serialize(row), key: out_b64}
+
+
+# ---------- bulk cheque entry (CSV) ----------
+
+@app.post("/cheques/bulk", status_code=201)
+def bulk_create_cheques(bank_template_id: str = Form(...), file: UploadFile = File(...),
+                         dep=Depends(org_conn_writable)):
+    conn, claims = dep
+    if not conn.execute("SELECT 1 FROM bank_templates WHERE id = %s", (bank_template_id,)).fetchone():
+        raise ApiError(400, "VALIDATION_ERROR", "Bank template not found in your organization.", "bank_template_id")
+
+    raw = file.file.read()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise ApiError(400, "VALIDATION_ERROR", "File must be a UTF-8 encoded CSV.", "file")
+    reader = csv.DictReader(io.StringIO(text))
+    headers = {(h or "").strip() for h in (reader.fieldnames or [])}
+    if not {"payee_name", "amount", "cheque_date"}.issubset(headers):
+        raise ApiError(400, "VALIDATION_ERROR",
+                       "CSV must have columns: payee_name, amount, cheque_date (memo optional).", "file")
+
+    today = dt.date.today()
+    results = []
+    for i, raw_row in enumerate(reader, start=1):
+        row = {(k or "").strip(): (v or "").strip() for k, v in raw_row.items()}
+        payee_name = row.get("payee_name", "")
+        try:
+            with conn.transaction():
+                if not payee_name:
+                    raise ValueError("payee_name is required.")
+                try:
+                    amount_paise = round(float(row.get("amount", "")) * 100)
+                except ValueError:
+                    raise ValueError("amount must be a number.")
+                if amount_paise <= 0:
+                    raise ValueError("amount must be greater than zero.")
+                try:
+                    cheque_date = dt.date.fromisoformat(row.get("cheque_date", ""))
+                except ValueError:
+                    raise ValueError("cheque_date must be in YYYY-MM-DD format.")
+                if abs((cheque_date - today).days) > DATE_WINDOW_DAYS:
+                    raise ValueError(f"cheque_date must be within {DATE_WINDOW_DAYS} days of today.")
+                memo = row.get("memo") or None
+
+                payee = conn.execute(
+                    "SELECT id FROM payees WHERE org_id = %s AND name = %s",
+                    (claims["org_id"], payee_name),
+                ).fetchone()
+                if not payee:
+                    payee = conn.execute(
+                        "INSERT INTO payees (org_id, name) VALUES (%s, %s) RETURNING id",
+                        (claims["org_id"], payee_name),
+                    ).fetchone()
+
+                words = amount_to_words(amount_paise)
+                cheque = conn.execute(
+                    "INSERT INTO cheques (org_id, bank_template_id, payee_id, amount_paise, amount_words, "
+                    "cheque_date, memo, created_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (claims["org_id"], bank_template_id, payee["id"], amount_paise, words,
+                     cheque_date, memo, claims["sub"]),
+                ).fetchone()
+                audit(conn, claims["org_id"], cheque["id"], claims["sub"], "created", {"bulk": True})
+            results.append({"row": i, "status": "created", "cheque_id": str(cheque["id"]), "payee_name": payee_name})
+        except ValueError as e:
+            results.append({"row": i, "status": "error", "error": str(e), "payee_name": payee_name})
+
+    created = sum(1 for r in results if r["status"] == "created")
+    return {"created": created, "failed": len(results) - created, "rows": results}
 
 
 @app.get("/cheques")
