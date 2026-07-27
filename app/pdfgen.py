@@ -104,3 +104,47 @@ def generate_cheque_pdf(template: dict, data: dict, *, crossing: str | None = No
 
     c.save()
     return buf.getvalue()
+
+
+def generate_alignment_grid_pdf(page_width_mm: float, page_height_mm: float, step_mm: float = 10) -> bytes:
+    """Printer/leaf-size calibration aid: a plain 10mm ruled grid with mm
+    labels, printed with NO offset applied. Print this on blank paper, hold
+    it against (or under a light, against) the real cheque leaf, and read
+    off how far the leaf's boxes sit from the ruled lines — that's the
+    printer_offset_x/y_mm to enter on the Calibration page. This is a
+    separate calibration concern from per-field x/y placement: this
+    measures physical printer/tray drift, not where a field should go.
+    """
+    page_w = page_width_mm * mm
+    page_h = page_height_mm * mm
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=(page_w, page_h))
+
+    c.setLineWidth(0.3)
+    c.setStrokeColorRGB(0.55, 0.55, 0.55)
+    c.setFont("Helvetica", 5.5)
+    c.setFillColorRGB(0.3, 0.3, 0.3)
+
+    x = 0.0
+    while x <= page_width_mm + 1e-6:
+        px = x * mm
+        c.line(px, 0, px, page_h)
+        if x > 0:
+            c.drawString(px + 0.8, 2, str(int(x)))
+        x += step_mm
+
+    y = 0.0
+    while y <= page_height_mm + 1e-6:
+        # y is measured from the top edge, matching bank_templates field convention
+        py = page_h - y * mm
+        c.line(0, py, page_w, py)
+        if y > 0:
+            c.drawString(2, py + 0.8, str(int(y)))
+        y += step_mm
+
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setLineWidth(0.8)
+    c.rect(0, 0, page_w, page_h)
+
+    c.save()
+    return buf.getvalue()

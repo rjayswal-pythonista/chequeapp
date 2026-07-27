@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from app import billing, core
 from app.amount_words import amount_to_words
 from app.escp import generate_cheque_escp
-from app.pdfgen import generate_cheque_pdf
+from app.pdfgen import generate_alignment_grid_pdf, generate_cheque_pdf
 
 app = FastAPI(title="Cheque Printing SaaS")
 
@@ -699,6 +699,26 @@ def set_calibration(template_id: str, body: CalibrationIn, dep=Depends(org_conn_
     return {**row, "id": str(row["id"]),
             "printer_offset_x_mm": float(row["printer_offset_x_mm"]),
             "printer_offset_y_mm": float(row["printer_offset_y_mm"])}
+
+
+@app.get("/bank-templates/{template_id}/alignment-grid")
+def get_alignment_grid(template_id: str, dep=Depends(org_conn)):
+    """A blank 10mm ruled grid, sized to this template's leaf, with NO
+    printer offset applied. Print it on plain paper and hold it against the
+    real cheque leaf to read off the printer's physical x/y drift — enter
+    that as the calibration offset. This is separate from per-field
+    placement, which is set on the template's `fields`."""
+    conn, _ = dep
+    row = conn.execute(
+        "SELECT page_width_mm, page_height_mm, bank_name FROM bank_templates WHERE id = %s",
+        (template_id,),
+    ).fetchone()
+    if not row:
+        raise ApiError(404, "NOT_FOUND", "Bank template not found.")
+    pdf = generate_alignment_grid_pdf(float(row["page_width_mm"]), float(row["page_height_mm"]))
+    safe_name = "".join(c if c.isalnum() else "_" for c in row["bank_name"])
+    return Response(content=pdf, media_type="application/pdf",
+                     headers={"Content-Disposition": f"attachment; filename=alignment_grid_{safe_name}.pdf"})
 
 
 @app.get("/bank-templates")

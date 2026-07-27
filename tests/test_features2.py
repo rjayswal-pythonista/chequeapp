@@ -158,6 +158,20 @@ def test_bank_template_get_and_patch_admin_only(client):
     assert r.json()["page_width_mm"] == 210
 
 
+def test_alignment_grid_pdf(client):
+    admin_tok, _ = _signup(client, "Org Grid", "admin@grid.test")
+    _, tpl_id = _setup_org_basics(client, admin_tok)
+
+    r = client.get(f"/bank-templates/{tpl_id}/alignment-grid", headers=_auth(admin_tok))
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/pdf"
+    assert r.content.startswith(b"%PDF")
+
+    r = client.get("/bank-templates/00000000-0000-0000-0000-000000000000/alignment-grid",
+                   headers=_auth(admin_tok))
+    assert r.status_code == 404
+
+
 # ---------------- exportable register ----------------
 
 def test_export_register_csv_and_pdf(client):

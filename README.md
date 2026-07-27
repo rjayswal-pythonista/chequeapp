@@ -80,6 +80,21 @@ is final, same as before.
 frontend Bank templates page — build/edit templates (dimensions, per-field
 x/y/font/bold/underline) without hand-writing JSON via the API.
 
+Field placement is visual, not just numeric: click a field to arm it, then
+click on a to-scale canvas (or drag an existing marker) to set its x/y —
+the exact mm values update live and a confirmation shows what was set.
+Arrow keys nudge the selected field by 0.5mm (Shift = 2mm). Optionally
+upload a photo/scan of the real blank cheque leaf as a canvas background
+(client-side only, stored in browser localStorage) so you click directly on
+the payee/amount/date boxes instead of guessing coordinates. The numeric
+inputs are still available below the canvas for typing exact values.
+
+`GET /bank-templates/{id}/alignment-grid` returns a plain 10mm-ruled PDF
+(no offset applied) to print on blank paper and hold against the real leaf —
+read off the physical printer drift and enter it on the Calibration page.
+This is a separate concern from field placement: it calibrates the
+printer/tray, not where each field sits on the template.
+
 ## Exportable register (Gap Analysis — Medium priority)
 `GET /cheques/export?format=csv|pdf` (same filters as `/cheques`). Register
 page has Export CSV / Export PDF buttons.
