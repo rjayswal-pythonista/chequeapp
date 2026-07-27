@@ -33,6 +33,7 @@ function Shell({ children }) {
         {isAdmin && <NavLink to="/settings">Settings</NavLink>}
         <div className="spacer" />
         <button className="signout" onClick={() => { setToken(null); nav('/login') }}>Sign out</button>
+        <div className="powered-by">Powered by SHA Innovations</div>
       </nav>
       <main>{children}</main>
     </>
