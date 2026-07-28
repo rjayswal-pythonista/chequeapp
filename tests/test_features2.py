@@ -26,6 +26,9 @@ def client():
 
 
 def _add_user(client, admin_tok, email, role):
+    # Tier caps are enforced (starter = 1 user); bump to business first so
+    # tests that need multiple users aren't blocked by that unrelated cap.
+    client.patch("/org/settings", json={"plan_tier": "business"}, headers=_auth(admin_tok))
     r = client.post("/users", json={"email": email, "password": "pw12345", "role": role},
                     headers=_auth(admin_tok))
     assert r.status_code == 201, r.text
@@ -48,7 +51,13 @@ def test_org_settings_get_update_admin_only(client):
 
     r = client.get("/org/settings", headers=_auth(tok))
     assert r.status_code == 200
-    assert r.json() == {"maker_checker_enabled": False, "dual_approval_threshold_paise": None}
+    body = r.json()
+    assert body["maker_checker_enabled"] is False
+    assert body["dual_approval_threshold_paise"] is None
+    assert body["plan_tier"] == "starter"
+    assert body["on_trial"] is True
+    assert body["trial_ends_at"] is not None
+    assert body["tier_limits"] == {"bank_templates": 1, "users": 1}
 
     maker_tok = _add_user(client, tok, "maker@settings.test", "maker")
     r = client.patch("/org/settings", json={"maker_checker_enabled": True}, headers=_auth(maker_tok))
@@ -58,13 +67,20 @@ def test_org_settings_get_update_admin_only(client):
                      json={"maker_checker_enabled": True, "dual_approval_threshold_paise": 10000000},
                      headers=_auth(tok))
     assert r.status_code == 200
-    assert r.json() == {"maker_checker_enabled": True, "dual_approval_threshold_paise": 10000000}
+    body = r.json()
+    assert body["maker_checker_enabled"] is True and body["dual_approval_threshold_paise"] == 10000000
 
     r = client.patch("/org/settings", json={"dual_approval_threshold_paise": 0}, headers=_auth(tok))
     assert r.status_code == 400 and r.json()["error"]["field"] == "dual_approval_threshold_paise"
 
     r = client.patch("/org/settings", json={"clear_dual_approval_threshold": True}, headers=_auth(tok))
     assert r.status_code == 200 and r.json()["dual_approval_threshold_paise"] is None
+
+    r = client.patch("/org/settings", json={"plan_tier": "bogus"}, headers=_auth(tok))
+    assert r.status_code == 400 and r.json()["error"]["field"] == "plan_tier"
+
+    r = client.patch("/org/settings", json={"plan_tier": "growth"}, headers=_auth(tok))
+    assert r.status_code == 200 and r.json()["plan_tier"] == "growth"
 
 
 # ---------------- amount-tiered dual approval ----------------
@@ -218,3 +234,91 @@ def test_analytics_summary(client):
     assert payee_totals["Sharma Traders Pvt Ltd"] == 300000
     assert len(body["spend_by_month"]) == 1
     assert body["avg_approval_hours"] is not None
+
+
+# ---------------- free trial + per-tier resource caps ----------------
+
+def test_signup_starts_a_trial(client):
+    tok, org_id = _signup(client, "Org Trial", "admin@trial.test")
+    r = client.get("/billing/status", headers=_auth(tok))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["plan_tier"] == "starter"
+    assert body["subscription_status"] == "active"
+    assert body["on_trial"] is True
+    assert body["trial_ends_at"] is not None
+    ends = dt.datetime.fromisoformat(body["trial_ends_at"])
+    days_left = (ends - dt.datetime.now(ends.tzinfo)).days
+    assert 12 <= days_left <= 14  # ~14-day trial, allowing for test run time
+
+
+def test_starter_tier_caps_users_and_templates(client):
+    admin_tok, _ = _signup(client, "Org Starter Cap", "admin@startercap.test")
+    # the signup admin already occupies the starter tier's 1-user cap
+    r = client.post("/users", json={"email": "second@startercap.test", "password": "pw12345", "role": "maker"},
+                    headers=_auth(admin_tok))
+    assert r.status_code == 402 and r.json()["error"]["code"] == "PLAN_LIMIT_REACHED"
+
+    # first bank template succeeds (starter allows 1)
+    r = client.post("/bank-templates", json={
+        "bank_name": "HDFC", "page_width_mm": 203, "page_height_mm": 92,
+        "fields": SAMPLE_FIELDS}, headers=_auth(admin_tok))
+    assert r.status_code == 201
+
+    # a second template is over the starter cap
+    r = client.post("/bank-templates", json={
+        "bank_name": "ICICI", "page_width_mm": 203, "page_height_mm": 92,
+        "fields": SAMPLE_FIELDS}, headers=_auth(admin_tok))
+    assert r.status_code == 402 and r.json()["error"]["code"] == "PLAN_LIMIT_REACHED"
+
+    # upgrading the tier lifts both caps
+    r = client.patch("/org/settings", json={"plan_tier": "growth"}, headers=_auth(admin_tok))
+    assert r.status_code == 200 and r.json()["plan_tier"] == "growth"
+
+    r = client.post("/users", json={"email": "second@startercap.test", "password": "pw12345", "role": "maker"},
+                    headers=_auth(admin_tok))
+    assert r.status_code == 201
+    r = client.post("/bank-templates", json={
+        "bank_name": "ICICI", "page_width_mm": 203, "page_height_mm": 92,
+        "fields": SAMPLE_FIELDS}, headers=_auth(admin_tok))
+    assert r.status_code == 201
+
+
+def test_trial_expiry_blocks_writes_but_not_reads(client):
+    admin_tok, org_id = _signup(client, "Org Trial Expired", "admin@trialexpired.test")
+    payee, tpl = _setup_org_basics(client, admin_tok)
+
+    # time-travel: the trial ended yesterday, no payment was ever made
+    subprocess.run(["psql", "-d", "chequeapp", "-q", "-c",
+        f"UPDATE organizations SET trial_ends_at = now() - interval '1 day' WHERE id = '{org_id}'"],
+        check=True, capture_output=True)
+
+    r = client.post("/cheques", json={
+        "bank_template_id": tpl, "payee_id": payee,
+        "amount_paise": 100, "cheque_date": str(dt.date.today())}, headers=_auth(admin_tok))
+    assert r.status_code == 402
+    assert r.json()["error"]["code"] == "SUBSCRIPTION_LAPSED"
+    assert "trial" in r.json()["error"]["message"].lower()
+
+    # reads still work
+    r = client.get("/cheques", headers=_auth(admin_tok))
+    assert r.status_code == 200
+
+    # plan settings can still be changed even while lapsed (the manual "upgrade" escape hatch)
+    r = client.patch("/org/settings", json={"plan_tier": "business"}, headers=_auth(admin_tok))
+    assert r.status_code == 200
+
+    # but subscription_status itself only recovers via a real successful payment webhook
+    r = client.get("/billing/status", headers=_auth(admin_tok))
+    assert r.json()["subscription_status"] == "lapsed"
+    r = client.post("/billing/webhook", json={
+        "event_id": "evt_trial_recover", "event": "payment.captured", "org_id": org_id})
+    assert r.json()["status"] == "active"
+    r = client.post("/cheques", json={
+        "bank_template_id": tpl, "payee_id": payee,
+        "amount_paise": 100, "cheque_date": str(dt.date.today())}, headers=_auth(admin_tok))
+    assert r.status_code == 201
+
+    # once a real payment has succeeded, the trial clock no longer matters
+    r = client.get("/billing/status", headers=_auth(admin_tok))
+    assert r.json()["on_trial"] is False

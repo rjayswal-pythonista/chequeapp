@@ -75,11 +75,15 @@ def org_conn_writable(claims: dict = Depends(current_user)):
     (Task 5.8 read-only fallback). Reads stay on org_conn and keep working."""
     with core.connect() as conn:
         core.set_org_context(conn, claims["org_id"])
-        writable, status = billing.check_writable(conn, claims["org_id"])
+        writable, status, reason = billing.check_writable(conn, claims["org_id"])
         if not writable:
-            raise ApiError(402, "SUBSCRIPTION_LAPSED",
-                           "Subscription has lapsed. Viewing and search remain available; "
-                           "renew to create or print cheques.")
+            if reason == "trial_expired":
+                message = (f"Your {billing.TRIAL_DAYS}-day free trial has ended. Subscribe to keep "
+                           "creating and printing cheques — viewing and search still work.")
+            else:
+                message = ("Subscription has lapsed. Viewing and search remain available; "
+                          "renew to create or print cheques.")
+            raise ApiError(402, "SUBSCRIPTION_LAPSED", message)
         yield conn, claims
 
 
@@ -129,6 +133,8 @@ class OrgSettingsIn(BaseModel):
     maker_checker_enabled: bool | None = None
     dual_approval_threshold_paise: int | None = None
     clear_dual_approval_threshold: bool = False  # explicit flag to null it out again
+    plan_tier: str | None = None  # 'starter' | 'growth' | 'business' — manual upgrade until
+                                   # real Razorpay checkout exists
 
 
 
@@ -149,8 +155,10 @@ def audit(conn, org_id, cheque_id, actor, action, detail=None):
 def signup(body: SignupIn):
     with core.connect() as conn:
         org = conn.execute(
-            "INSERT INTO organizations (name) VALUES (%s) RETURNING id, name, plan_tier, maker_checker_enabled",
-            (body.org_name,),
+            "INSERT INTO organizations (name, trial_ends_at) "
+            "VALUES (%s, now() + make_interval(days => %s)) "
+            "RETURNING id, name, plan_tier, maker_checker_enabled, trial_ends_at",
+            (body.org_name, billing.TRIAL_DAYS),
         ).fetchone()
         core.set_org_context(conn, org["id"])
         try:
@@ -162,8 +170,10 @@ def signup(body: SignupIn):
         except Exception:
             raise ApiError(409, "CONFLICT", "An account with this email already exists.", "email")
         token = core.make_token(user["id"], org["id"], "admin")
+        org_out = {**org, "id": str(org["id"]),
+                   "trial_ends_at": org["trial_ends_at"].isoformat() if org["trial_ends_at"] else None}
         return {"user": {**user, "id": str(user["id"])},
-                "org": {**org, "id": str(org["id"])},
+                "org": org_out,
                 "token": token}
 
 
@@ -185,6 +195,13 @@ def add_user(body: UserIn, dep=Depends(org_conn)):
         raise ApiError(403, "FORBIDDEN", "Only admins can add users.")
     if body.role not in ("admin", "maker", "checker"):
         raise ApiError(400, "VALIDATION_ERROR", "Invalid role.", "role")
+    plan_tier = conn.execute(
+        "SELECT plan_tier FROM organizations WHERE id = %s", (claims["org_id"],)
+    ).fetchone()["plan_tier"]
+    allowed, limit = billing.check_tier_limit(conn, claims["org_id"], plan_tier, "users")
+    if not allowed:
+        raise ApiError(402, "PLAN_LIMIT_REACHED",
+                       f"Your {plan_tier} plan allows up to {limit} user(s). Upgrade to add more.")
     try:
         user = conn.execute(
             "INSERT INTO users (org_id, email, password_hash, role) VALUES (%s,%s,%s,%s) "
@@ -202,21 +219,34 @@ def add_user(body: UserIn, dep=Depends(org_conn)):
 def get_org_settings(dep=Depends(org_conn)):
     conn, claims = dep
     row = conn.execute(
-        "SELECT maker_checker_enabled, dual_approval_threshold_paise FROM organizations WHERE id = %s",
+        "SELECT maker_checker_enabled, dual_approval_threshold_paise, plan_tier, "
+        "subscription_status, trial_ends_at, subscription_started_at "
+        "FROM organizations WHERE id = %s",
         (claims["org_id"],),
     ).fetchone()
     return {"maker_checker_enabled": row["maker_checker_enabled"],
-            "dual_approval_threshold_paise": row["dual_approval_threshold_paise"]}
+            "dual_approval_threshold_paise": row["dual_approval_threshold_paise"],
+            "plan_tier": row["plan_tier"],
+            "subscription_status": row["subscription_status"],
+            "trial_ends_at": row["trial_ends_at"].isoformat() if row["trial_ends_at"] else None,
+            "on_trial": row["subscription_started_at"] is None,
+            "tier_limits": billing.TIER_LIMITS.get(row["plan_tier"], billing.TIER_LIMITS["starter"])}
 
 
 @app.patch("/org/settings")
-def update_org_settings(body: OrgSettingsIn, dep=Depends(org_conn_writable)):
+def update_org_settings(body: OrgSettingsIn, dep=Depends(org_conn)):
+    # Deliberately org_conn (not org_conn_writable): an admin must be able to
+    # change the plan tier (the manual "upgrade" path, pending real Razorpay
+    # checkout) even once an org is read-only/lapsed — otherwise there'd be
+    # no way out of the lapsed state in this scaffold.
     conn, claims = dep
     if claims["role"] != "admin":
         raise ApiError(403, "FORBIDDEN", "Only admins can change organization settings.")
     if body.dual_approval_threshold_paise is not None and body.dual_approval_threshold_paise <= 0:
         raise ApiError(400, "VALIDATION_ERROR", "Threshold must be greater than zero.",
                        "dual_approval_threshold_paise")
+    if body.plan_tier is not None and body.plan_tier not in billing.TIER_LIMITS:
+        raise ApiError(400, "VALIDATION_ERROR", "Invalid plan_tier.", "plan_tier")
     fields, params = [], []
     if body.maker_checker_enabled is not None:
         fields.append("maker_checker_enabled = %s"); params.append(body.maker_checker_enabled)
@@ -224,16 +254,19 @@ def update_org_settings(body: OrgSettingsIn, dep=Depends(org_conn_writable)):
         fields.append("dual_approval_threshold_paise = NULL")
     elif body.dual_approval_threshold_paise is not None:
         fields.append("dual_approval_threshold_paise = %s"); params.append(body.dual_approval_threshold_paise)
+    if body.plan_tier is not None:
+        fields.append("plan_tier = %s"); params.append(body.plan_tier)
     if not fields:
         raise ApiError(400, "VALIDATION_ERROR", "No settings provided to update.")
     params.append(claims["org_id"])
     row = conn.execute(
         f"UPDATE organizations SET {', '.join(fields)} WHERE id = %s "
-        "RETURNING maker_checker_enabled, dual_approval_threshold_paise",
+        "RETURNING maker_checker_enabled, dual_approval_threshold_paise, plan_tier",
         params,
     ).fetchone()
     return {"maker_checker_enabled": row["maker_checker_enabled"],
-            "dual_approval_threshold_paise": row["dual_approval_threshold_paise"]}
+            "dual_approval_threshold_paise": row["dual_approval_threshold_paise"],
+            "plan_tier": row["plan_tier"]}
 
 
 # ---------- payees ----------
@@ -265,6 +298,13 @@ def create_template(body: TemplateIn, dep=Depends(org_conn_writable)):
     conn, claims = dep
     if claims["role"] != "admin":
         raise ApiError(403, "FORBIDDEN", "Only admins can create bank templates.")
+    plan_tier = conn.execute(
+        "SELECT plan_tier FROM organizations WHERE id = %s", (claims["org_id"],)
+    ).fetchone()["plan_tier"]
+    allowed, limit = billing.check_tier_limit(conn, claims["org_id"], plan_tier, "bank_templates")
+    if not allowed:
+        raise ApiError(402, "PLAN_LIMIT_REACHED",
+                       f"Your {plan_tier} plan allows up to {limit} bank template(s). Upgrade to add more.")
     row = conn.execute(
         "INSERT INTO bank_templates (org_id, bank_name, page_width_mm, page_height_mm, fields) "
         "VALUES (%s, %s, %s, %s, %s) RETURNING id, bank_name",
@@ -758,8 +798,11 @@ def billing_webhook(payload: dict):
 def billing_status(dep=Depends(org_conn)):
     conn, claims = dep
     row = conn.execute(
-        "SELECT plan_tier, subscription_status, grace_until FROM organizations WHERE id = %s",
+        "SELECT plan_tier, subscription_status, grace_until, trial_ends_at, subscription_started_at "
+        "FROM organizations WHERE id = %s",
         (claims["org_id"],),
     ).fetchone()
     return {"plan_tier": row["plan_tier"], "subscription_status": row["subscription_status"],
-            "grace_until": row["grace_until"].isoformat() if row["grace_until"] else None}
+            "grace_until": row["grace_until"].isoformat() if row["grace_until"] else None,
+            "trial_ends_at": row["trial_ends_at"].isoformat() if row["trial_ends_at"] else None,
+            "on_trial": row["subscription_started_at"] is None}

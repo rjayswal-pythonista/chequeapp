@@ -141,6 +141,7 @@ def test_cheque_validation(client):
 def test_maker_checker_flow(client):
     admin_tok, org_id = _signup(client, "Org MC", "admin@mc.test", maker_checker=True)
     payee, tpl = _setup_org_basics(client, admin_tok)
+    client.patch("/org/settings", json={"plan_tier": "business"}, headers=_auth(admin_tok))
 
     client.post("/users", json={"email": "maker@mc.test", "password": "pw12345", "role": "maker"},
                 headers=_auth(admin_tok))

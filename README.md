@@ -67,6 +67,23 @@ are read-only: register/search keep working, create/print return 402
 SUBSCRIPTION_LAPSED. Razorpay HMAC signature verification is stubbed
 (no live credentials in this scaffold) — see app/billing.py.
 
+## Free trial + per-tier resource caps
+New orgs get a 14-day free trial (`organizations.trial_ends_at`, set at
+signup). If it passes with no successful payment ever recorded
+(`subscription_started_at` stays NULL), the org lazily lapses into the
+same read-only fallback as a failed-payment grace expiry — checked on
+write, same pattern as `check_writable()`'s existing grace logic. One real
+successful webhook payment sets `subscription_started_at` once, permanently
+ending trial-expiry checks for that org.
+
+Per-tier caps (`billing.TIER_LIMITS`) are enforced at creation time:
+Starter = 1 bank template / 1 user, Growth = 5 / 5, Business = unlimited.
+Exceeding a cap returns `402 PLAN_LIMIT_REACHED`. `PATCH /org/settings`
+lets an admin change `plan_tier` directly — a manual stand-in for a real
+Razorpay checkout/upgrade flow, and deliberately allowed even while an
+org is lapsed (otherwise there'd be no way out of read-only mode without
+live payment credentials).
+
 ## Amount-tiered dual approval (Gap Analysis — Medium priority)
 Admin-configurable `dual_approval_threshold_paise` (Settings page /
 `PATCH /org/settings`, admin-only). Cheques at or above the threshold move

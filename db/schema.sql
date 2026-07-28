@@ -13,6 +13,8 @@ CREATE TABLE organizations (
   subscription_status TEXT NOT NULL DEFAULT 'active'
     CHECK (subscription_status IN ('active','grace','lapsed')),
   grace_until TIMESTAMPTZ,
+  trial_ends_at TIMESTAMPTZ,             -- set at signup; free trial window with no payment required
+  subscription_started_at TIMESTAMPTZ,   -- set once a real payment succeeds; NULL means "still on trial"
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

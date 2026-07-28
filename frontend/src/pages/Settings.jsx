@@ -1,17 +1,26 @@
 import React, { useEffect, useState } from 'react'
 import { api, currentClaims } from '../api.js'
 
+const PLAN_DESCRIPTIONS = {
+  starter: '1 bank template, 1 user, basic register',
+  growth: 'Up to 5 bank templates, up to 5 users, saved payees, multi-account',
+  business: 'Unlimited templates and users, maker-checker, dual approval, priority support',
+}
+
 export default function Settings() {
   const [settings, setSettings] = useState(null)
   const [threshold, setThreshold] = useState('')
   const [makerChecker, setMakerChecker] = useState(false)
+  const [planTier, setPlanTier] = useState('starter')
   const [note, setNote] = useState(null)
+  const [planNote, setPlanNote] = useState(null)
   const [busy, setBusy] = useState(false)
   const isAdmin = currentClaims()?.role === 'admin'
 
   const load = () => api('/org/settings').then(s => {
     setSettings(s)
     setMakerChecker(s.maker_checker_enabled)
+    setPlanTier(s.plan_tier)
     setThreshold(s.dual_approval_threshold_paise != null ? (s.dual_approval_threshold_paise / 100).toString() : '')
   }).catch(e => setNote(e.message))
 
@@ -44,6 +53,17 @@ export default function Settings() {
     finally { setBusy(false) }
   }
 
+  async function savePlan(e) {
+    e.preventDefault()
+    setBusy(true); setPlanNote(null)
+    try {
+      await api('/org/settings', { method: 'PATCH', body: { plan_tier: planTier } })
+      setPlanNote({ kind: 'ok', text: `Plan changed to ${planTier}.` })
+      load()
+    } catch (err) { setPlanNote({ kind: 'err', text: err.message }) }
+    finally { setBusy(false) }
+  }
+
   if (!isAdmin) {
     return (
       <>
@@ -56,10 +76,39 @@ export default function Settings() {
   return (
     <>
       <h1>Settings</h1>
-      <div className="sub">Organization-wide approval controls.</div>
+      <div className="sub">Organization-wide plan and approval controls.</div>
       {note && <div className={note.kind === 'ok' ? 'ok-note' : 'error-note'} style={{ marginBottom: 14 }}>{note.text}</div>}
       {settings && (
         <div style={{ maxWidth: 460 }}>
+          {settings.on_trial && settings.trial_ends_at && (
+            <div className="ok-note" style={{ marginBottom: 20 }}>
+              Free trial active — ends {new Date(settings.trial_ends_at).toLocaleDateString()}.
+              Subscribe before then to keep creating and printing cheques.
+            </div>
+          )}
+
+          <p style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink-soft)', margin: '0 0 8px', textTransform: 'uppercase', letterSpacing: '0.02em' }}>
+            Plan
+          </p>
+          <form onSubmit={savePlan}>
+            <label htmlFor="plan_tier">Current plan</label>
+            <select id="plan_tier" value={planTier} onChange={e => setPlanTier(e.target.value)}>
+              {Object.keys(PLAN_DESCRIPTIONS).map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+            <p style={{ fontSize: 13, color: 'var(--ink-soft)', marginTop: 8 }}>{PLAN_DESCRIPTIONS[planTier]}</p>
+            {settings.tier_limits && (
+              <p style={{ fontSize: 12.5, color: 'var(--ink-soft)' }}>
+                Current limits: {settings.tier_limits.bank_templates ?? 'Unlimited'} bank template(s),{' '}
+                {settings.tier_limits.users ?? 'Unlimited'} user(s).
+              </p>
+            )}
+            {planNote && <div className={planNote.kind === 'ok' ? 'ok-note' : 'error-note'}>{planNote.text}</div>}
+            <button className="primary" disabled={busy} style={{ marginTop: 8 }}>Change plan</button>
+          </form>
+
+          <p style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink-soft)', margin: '28px 0 8px', textTransform: 'uppercase', letterSpacing: '0.02em' }}>
+            Approvals
+          </p>
           <form onSubmit={saveMakerChecker}>
             <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <input type="checkbox" checked={makerChecker} onChange={e => setMakerChecker(e.target.checked)}
